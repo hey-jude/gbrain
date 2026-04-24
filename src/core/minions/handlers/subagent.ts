@@ -78,7 +78,6 @@ import { chatInvocation } from '../../ai/guarded-generation.ts';
 
 // ── Defaults ────────────────────────────────────────────────
 
-const DEFAULT_MODEL = 'claude-sonnet-4-6';
 const DEFAULT_MAX_TURNS = 20;
 const DEFAULT_MAX_OUTPUT_TOKENS = 8192;
 const DEFAULT_RATE_KEY = 'anthropic:messages';
@@ -257,12 +256,20 @@ export function makeSubagentHandler(deps: SubagentDeps) {
   // lives at sdk.messages.create. Assigning sdk.messages directly gets the
   // right object; JS method-call semantics preserve `this` at the call
   // site (subagent.ts invokes client.create(...) with client === sdk.messages).
-  // Resolve the key env-first, then config (anthropic_api_key) — a bare
-  // new Anthropic() only reads env, so launchd/MCP workers whose key lives
-  // in the gbrain config file would fail auth (#2048).
-  const makeAnthropic = deps.makeAnthropic ?? (() => new Anthropic({ apiKey: resolveAnthropicKey() }));
-  const client: MessagesClient = deps.client ?? makeAnthropic().messages;
+  // Custom endpoint support: resolve key env-first, then config
+  // (anthropic_api_key) — a bare new Anthropic() only reads env, so
+  // launchd/MCP workers whose key lives in the gbrain config file would fail
+  // auth (#2048). baseURL/apiKey honor ANTHROPIC_BASE_URL /
+  // ANTHROPIC_SUBAGENT_MODEL env overrides before the config-file slots.
   const config = deps.config ?? loadConfig() ?? ({ engine: 'postgres' } as GBrainConfig);
+  const DEFAULT_MODEL = config?.anthropic_subagent_model ?? DEFAULT_SUBAGENT_MODEL;
+  const baseURL = process.env.ANTHROPIC_BASE_URL || config?.anthropic_base_url;
+  const apiKey = process.env.ANTHROPIC_API_KEY || resolveAnthropicKey();
+  const opts: Record<string, unknown> = {};
+  if (baseURL) opts.baseURL = baseURL;
+  if (apiKey) opts.apiKey = apiKey;
+  const makeAnthropic = deps.makeAnthropic ?? (() => new Anthropic(opts));
+  const client: MessagesClient = deps.client ?? makeAnthropic().messages;
   const rateLeaseKey = deps.rateLeaseKey ?? DEFAULT_RATE_KEY;
   const maxConcurrent = deps.maxConcurrent ?? DEFAULT_MAX_CONCURRENT;
   const leaseTtlMs = deps.leaseTtlMs ?? DEFAULT_LEASE_TTL_MS;
@@ -1884,6 +1891,9 @@ function matchesPromptTooLong(err: unknown): string | null {
 
 // ── Testing surface ─────────────────────────────────────────
 
+// Exported for tests only — keep in sync with the default in makeSubagentHandler
+export const DEFAULT_SUBAGENT_MODEL = 'claude-sonnet-4-6';
+
 export const __testing = {
   loadPriorMessages,
   loadPriorTools,
@@ -1892,10 +1902,7 @@ export const __testing = {
   persistToolExecComplete,
   persistToolExecFailed,
   asStringIfNotObject,
-  DEFAULT_MODEL,
-  // v0.38 Slice 1 D5 — read-time shim for crash-replay across the v1→v2
-  // content_blocks shape boundary. Exposed for test/subagent-v1-v2-shim.test.ts
-  // which pins legacy-row adaptation correctness.
+  DEFAULT_SUBAGENT_MODEL,
   adaptContentBlocksToChatBlocks,
   loadPriorToolsV2,
 };

@@ -70,7 +70,12 @@ export interface GBrainConfig {
   database_url?: string;
   database_path?: string;
   openai_api_key?: string;
+  openai_base_url?: string;
+  openai_embedding_model?: string;
   anthropic_api_key?: string;
+  anthropic_base_url?: string;
+  anthropic_expansion_model?: string;
+  anthropic_subagent_model?: string;
   /**
    * ZeroEntropy API key. v0.37 fix wave (CDX2-5+6): ZE became the default
    * embedding + reranker provider in v0.36 but lacked a file-plane config
@@ -821,6 +826,12 @@ export function loadConfig(): GBrainConfig | null {
     ...(process.env.GBRAIN_REMOTE_CLIENT_SECRET && fileConfig?.remote_mcp
       ? { remote_mcp: { ...fileConfig.remote_mcp, oauth_client_secret: process.env.GBRAIN_REMOTE_CLIENT_SECRET } }
       : {}),
+    // Custom LLM endpoint support (d46051297): subagent's direct-Anthropic
+    // client path is deliberately gateway-independent, so it keeps its own
+    // env→config slots. Embedding/expansion ride the gateway (base_urls,
+    // provider_base_urls) — no parallel slots needed here.
+    ...(process.env.ANTHROPIC_BASE_URL ? { anthropic_base_url: process.env.ANTHROPIC_BASE_URL } : {}),
+    ...(process.env.ANTHROPIC_SUBAGENT_MODEL ? { anthropic_subagent_model: process.env.ANTHROPIC_SUBAGENT_MODEL } : {}),
   };
 
   // v0.41 content-sanity env overrides. Built up as a sparse object so
