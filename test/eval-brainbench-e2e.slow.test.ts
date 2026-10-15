@@ -21,15 +21,28 @@
 import { beforeAll, describe, expect, test } from 'bun:test';
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
+import { PAGE_MAX_BYTES } from '../src/core/page-size-policy.ts';
 
 const REPO = process.cwd();
 const CLI = join(REPO, 'src', 'cli.ts');
 let root: string;
 let fixtures: string;
 let gold: string;
+let cliSnapshot = process.env.GBRAIN_TEST_DEFAULT_SNAPSHOT;
 
 type RunResult = { exitCode: number; stdout: string; stderr: string };
+
+function brainBenchEnv(): NodeJS.ProcessEnv {
+  const snapshot = process.env.GBRAIN_NO_SNAPSHOT === '1' ? undefined : cliSnapshot;
+  return {
+    ...process.env,
+    GBRAIN_QUIET: '1',
+    // Bare CLI defaults are voyage-4/1024; its parent bun test uses legacy/1536.
+    // An absent default fixture falls back to cold init without a wrong-shape tar.
+    GBRAIN_PGLITE_SNAPSHOT: snapshot ? resolve(REPO, snapshot) : '',
+  };
+}
 
 function withDefaultCommittedBaseline(args: string[]): string[] {
   // Foreign-corpus runs opt OUT of the repo's committed baseline: the
@@ -43,7 +56,7 @@ function withDefaultCommittedBaseline(args: string[]): string[] {
 function run(args: string[], cwd = REPO): RunResult {
   const proc = Bun.spawnSync(['bun', CLI, 'eval', 'brainbench', ...withDefaultCommittedBaseline(args)], {
     cwd,
-    env: { ...process.env, GBRAIN_QUIET: '1' },
+    env: brainBenchEnv(),
     stdout: 'pipe',
     stderr: 'pipe',
   });
@@ -57,7 +70,7 @@ function run(args: string[], cwd = REPO): RunResult {
 async function runAsync(args: string[], cwd = REPO): Promise<RunResult> {
   const proc = Bun.spawn(['bun', CLI, 'eval', 'brainbench', ...withDefaultCommittedBaseline(args)], {
     cwd,
-    env: { ...process.env, GBRAIN_QUIET: '1' },
+    env: brainBenchEnv(),
     stdout: 'pipe',
     stderr: 'pipe',
   });
@@ -103,6 +116,14 @@ async function runBatch(jobs: Array<[string, string[], string?]>, width = 2): Pr
 }
 
 beforeAll(async () => {
+  // Direct `bun test` invocations need the same profile as the slow-lane runner.
+  if (!cliSnapshot && process.env.GBRAIN_NO_SNAPSHOT !== '1') {
+    const build = Bun.spawnSync([
+      process.execPath, join(REPO, 'scripts/build-pglite-snapshot.ts'), '--profile', 'default',
+    ], { cwd: REPO, env: { ...process.env }, stdout: 'pipe', stderr: 'pipe' });
+    if (build.exitCode === 0) cliSnapshot = join(REPO, 'test/fixtures/pglite-snapshot-default.tar');
+    else console.warn(`[brainbench] Default snapshot unavailable; using cold initialization. ${build.stderr.toString().trim()}`);
+  }
   root = mkdtempSync(join(tmpdir(), 'bb-e2e-'));
   fixtures = join(root, 'fixtures');
   gold = join(root, 'gold');
@@ -139,7 +160,7 @@ beforeAll(async () => {
   mkdirSync(join(dupRoot, 'fixtures'));
   mkdirSync(join(dupRoot, 'gold'));
   // A page whose content exceeds importFromContent's size cap → status 'skipped' → SeedError.
-  const huge = 'x'.repeat(5_000_001);
+  const huge = 'x'.repeat(PAGE_MAX_BYTES + 1);
   writeFileSync(
     join(dupRoot, 'fixtures', 'seedfail-001.fixture.json'),
     JSON.stringify({
@@ -183,6 +204,10 @@ describe('exit contract over a multi-brain run (PGLite exitCode-hijack guard)', 
     expect(doc.cells.length).toBeGreaterThan(0);
     expect(doc.seed_failures).toEqual([]);
     expect(r.stderr).not.toContain('not a git repository');
+    if (process.env.GBRAIN_TEST_DEFAULT_SNAPSHOT && process.env.GBRAIN_NO_SNAPSHOT !== '1') {
+      expect(r.stderr).not.toContain('embedding shape mismatch');
+      expect(r.stderr).not.toContain('migration(s) applied');
+    }
   }, 60_000);
 
   test('clean run: exit 0, --out is complete valid JSON with the glossary block', () => {
@@ -389,7 +414,7 @@ describe('run-all once-per-sweep semantics (decision 16)', () => {
     const outDir = mkdtempSync(join(tmpdir(), 'bb-runall-'));
     const proc = Bun.spawnSync(
       ['bun', 'src/cli.ts', 'eval', 'run-all', '--suites', 'brainbench', '--modes', 'conservative,balanced', '--output', outDir],
-      { cwd: REPO, env: { ...process.env }, stdout: 'pipe', stderr: 'pipe' },
+      { cwd: REPO, env: brainBenchEnv(), stdout: 'pipe', stderr: 'pipe' },
     );
     expect(proc.exitCode).toBe(0);
     const lines = readFileSync(join(outDir, 'eval-results.jsonl'), 'utf-8').trim().split('\n');
@@ -399,6 +424,7 @@ describe('run-all once-per-sweep semantics (decision 16)', () => {
     expect(record.suite).toBe('brainbench');
     expect(record.mode).toBe('n/a');
     expect(record.status).toBe('completed');
-    expect(Object.keys(record.params.cells).length).toBe(12);
-  }, 120_000);
+    // 3 harnesses x 8 suites (the four memory-trust suites, #5575, joined the four retrieval/write suites).
+    expect(Object.keys(record.params.cells).length).toBe(24);
+  }, 240_000);
 });

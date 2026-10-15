@@ -60,6 +60,7 @@ function buildMockEngine(opts: {
     },
     async executeRaw<T>(sql: string, params?: unknown[]): Promise<T[]> {
       captured.push({ sql, params: params ?? [] });
+      if (sql.includes('FROM persistence_brain')) return [{ enabled: false } as unknown as T]; // #6482: the strict mode reader needs one well-formed unmanaged row.
       // Narrow candidate-page projection (replaces listPages in the phase).
       if (sql.includes('SELECT slug, source_id, compiled_truth')) {
         return opts.pages.map((p) => ({
@@ -249,6 +250,30 @@ describe('parseExtractorOutput', () => {
     const out = parseExtractorOutput(raw);
     expect(out).toHaveLength(1);
     expect(out[0]!.claim_text).toBe('Z');
+  });
+
+  // #5209: recovery must stop at the value's own closing bracket; the last
+  // `]`/`}` in the reply can belong to prose after it.
+  const take = (claim: string, kind = 'take') => JSON.stringify({ claim_text: claim, kind, holder: 'brain', weight: 0.7 });
+
+  test('an array followed by a numbered citation keeps its takes', () => {
+    const out = parseExtractorOutput(`[${take('Pricing beats features')},${take('Hiring lags plan', 'bet')}]\n[1] board memo`);
+    expect(out.map(t => [t.claim_text, t.kind])).toEqual([['Pricing beats features', 'take'], ['Hiring lags plan', 'bet']]);
+  });
+
+  test('a lone object followed by a stray `]` is recovered', () => {
+    const out = parseExtractorOutput(`${take('Churn is seasonal', 'hunch')}\n]`);
+    expect(out.map(t => t.claim_text)).toEqual(['Churn is seasonal']);
+  });
+
+  test('brackets, braces and an escaped quote inside claim_text', () => {
+    const claim = 'Ratio {a]/[b} is "stable"';
+    const out = parseExtractorOutput(`[${take(claim)}] per [[companies/acme-example]]`);
+    expect(out.map(t => t.claim_text)).toEqual([claim]);
+  });
+
+  test('control: a cut-off array followed by a citation still yields nothing', () => {
+    expect(parseExtractorOutput(`[${take('A')},{"claim_text":"B"\nSee [Source: memo]`)).toEqual([]);
   });
 });
 
@@ -626,7 +651,9 @@ New prose appended here.`;
 
       const result = await runPhaseProposeTakes(buildCtx(engine), {
         extractor,
-        meter: new BudgetMeter({ budgetUsd: 0.000001, phase: 'propose_takes' }),
+        // The OpenRouter alias is not in the canonical pricing table; the
+        // opt-in bypass keeps this test about model-id preservation (C-16).
+        meter: new BudgetMeter({ budgetUsd: 0.000001, phase: 'propose_takes', allowUnpriced: true }),
       });
 
       expect(result.status).toBe('ok');
@@ -653,6 +680,25 @@ New prose appended here.`;
         expect(result.status).toBe('skipped');
         expect((result.details as Record<string, unknown>).reason).toBe('no_provider');
         // Skips BEFORE touching the engine — no page scan, no cache probes.
+        expect(captured).toHaveLength(0);
+      } finally {
+        resetGateway();
+      }
+    });
+  });
+
+  test('default extractor skips cleanly when a non-Anthropic chat model has no key (#6705)', async () => {
+    await withEnv({ GBRAIN_HOME: emptyHome(), OPENAI_API_KEY: undefined }, async () => {
+      configureGateway({ chat_model: 'openai:gpt-5.6', env: {} });
+      try {
+        const { engine, captured } = buildMockEngine({
+          pages: [buildPage({ slug: 'wiki/c', body: 'claim-ish prose' })],
+        });
+        const result = await runPhaseProposeTakes(buildCtx(engine));
+
+        expect(result.status).toBe('skipped');
+        expect((result.details as Record<string, unknown>).reason).toBe('no_provider');
+        expect(result.summary).toContain('OPENAI_API_KEY');
         expect(captured).toHaveLength(0);
       } finally {
         resetGateway();
@@ -1026,6 +1072,37 @@ describe('runPhaseProposeTakes — global-error halt (#3044)', () => {
   });
 });
 
+// ─── #4312: pricing.overrides reach the base-phase budget gate ─────
+
+describe('pricing.overrides reach the base-phase meter (#4312)', () => {
+  test('a $0 operator override lets a capped phase run instead of exhausting at list price', async () => {
+    configureGateway({ chat_model: 'anthropic:claude-sonnet-4-6', env: { ANTHROPIC_API_KEY: 'test-key' } });
+    try {
+      const run = async (overrides: string | null) => {
+        const pages = [buildPage({ slug: 'wiki/override', body: 'an operator rate should price the gate' })];
+        const { engine, captured } = buildMockEngine({ pages });
+        (engine as unknown as { getConfig: (k: string) => Promise<string | null> }).getConfig =
+          async (k: string) => (k === 'pricing.overrides' ? overrides : null);
+        const extractor: ProposeTakesExtractor = async () => [
+          { claim_text: 'an operator rate should price the gate', kind: 'take', holder: 'brain', weight: 0.5 },
+        ];
+        const result = await runPhaseProposeTakes(buildCtx(engine), { extractor, budgetUsd: 0.000001 });
+        return { result, inserted: captured.some(c => c.sql.includes('INSERT INTO take_proposals')) };
+      };
+      // Control: at list price the cap is binding.
+      const listed = await run(null);
+      expect(listed.result.details.budget_exhausted).toBe(true);
+      expect(listed.inserted).toBe(false);
+      // With the operator's $0 rate the same cap admits the call.
+      const priced = await run('{"anthropic:claude-sonnet-4-6": 0}');
+      expect(priced.result.details.budget_exhausted).toBe(false);
+      expect(priced.inserted).toBe(true);
+    } finally {
+      resetGateway();
+    }
+  });
+});
+
 // ─── #4102: cycle.propose_takes.enabled off switch ─────────────────
 
 describe('cycle.propose_takes.enabled gate (#4102)', () => {
@@ -1095,5 +1172,40 @@ describe('cycle.propose_takes.enabled gate (#4102)', () => {
     const result = await runPhaseProposeTakes(buildCtx(engine), { extractor, once: true });
     expect(result.status).not.toBe('skipped');
     expect(calls()).toBe(1);
+  });
+});
+
+// ─── #4823: `gbrain dream --dry-run` promises "no writes" ────────────
+// BaseCyclePhase.run() must skip every subclass (propose_takes / grade_takes /
+// calibration_profile) under dry-run — they bill LLM calls and INSERT rows and
+// have no dry-run path of their own — the same shape extract uses.
+
+describe('runPhaseProposeTakes — dry-run (#4823)', () => {
+  function armedEngine(): { engine: BrainEngine; calls: () => number } {
+    let calls = 0;
+    const engine = {
+      kind: 'pglite',
+      async executeRaw() { calls++; throw new Error('executeRaw must not run under dry-run'); },
+      async listPages() { calls++; throw new Error('listPages must not run under dry-run'); },
+    } as unknown as BrainEngine;
+    return { engine, calls: () => calls };
+  }
+  const meter = () => new BudgetMeter({ budgetUsd: 1, phase: 'propose_takes' });
+
+  test('opts.dryRun: skipped with no_dry_run_support; engine never touched', async () => {
+    const { engine, calls } = armedEngine();
+    const r = await runPhaseProposeTakes(buildCtx(engine), { dryRun: true, meter: meter() });
+    expect(r.status).toBe('skipped');
+    expect(r.details.reason).toBe('no_dry_run_support');
+    expect(r.details.dryRun).toBe(true);
+    expect(calls()).toBe(0);
+  });
+
+  test('ctx.dryRun alone (caller forgot to thread opts): still skipped; engine never touched', async () => {
+    const { engine, calls } = armedEngine();
+    const r = await runPhaseProposeTakes({ ...buildCtx(engine), dryRun: true }, { meter: meter() });
+    expect(r.status).toBe('skipped');
+    expect(r.details.reason).toBe('no_dry_run_support');
+    expect(calls()).toBe(0);
   });
 });

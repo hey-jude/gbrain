@@ -18,7 +18,7 @@
  * dispatcher bug where viaSubagent=true but subagentId is missing.
  *
  * In v0.15 every allow-list op is treated as idempotent for the two-phase
- * replay path. put_page with a deterministic slug is idempotent at the row
+ * replay path. put_page with its persisted request UUID is idempotent at the journal
  * level; repeats re-derive the same embedding over identical content.
  */
 
@@ -30,51 +30,12 @@ import { paramDefToSchema } from '../../../mcp/tool-defs.ts';
 import { normalizeOptionalParams, validateParams } from '../../../mcp/validate-params.ts';
 import { validateSourceId } from '../../utils.ts';
 import type { ToolCtx, ToolDef } from '../types.ts';
+import { putPageRejection } from './put-page-result.ts';
+import { BRAIN_TOOL_ALLOWLIST } from './brain-tool-allowlist.ts';
 
-/**
- * v0.15 brain-tool allow-list. Review carefully when extending. Op names
- * verified against origin/master:src/core/operations.ts (post shell-jobs +
- * Knowledge Runtime).
- *
- * Read-only (all safe):
- *   query, search, get_page, list_pages,
- *   get_backlinks, traverse_graph, resolve_slugs, get_ingest_log
- *
- * Conditional write:
- *   put_page (namespace-enforced by the tool schema + server-side check)
- *
- * Every name below MUST exist in src/core/operations.ts OPERATIONS; the
- * brain-allowlist test pins this invariant so an upstream rename fails CI
- * instead of silently dropping a tool.
- */
-export const BRAIN_TOOL_ALLOWLIST: ReadonlySet<string> = new Set([
-  'query',
-  'search',
-  'get_page',
-  'list_pages',
-  'get_backlinks',
-  'traverse_graph',
-  // v114 (#1941): read-only provenance discovery. Edge-WRITE ops (add_link /
-  // remove_link) are deliberately NOT allowlisted — exposing graph writes to
-  // subagents is a separate trust decision.
-  'list_link_sources',
-  'resolve_slugs',
-  'get_ingest_log',
-  'put_page',
-  // #2778: the canonical timeline-write op. Fenced exactly like put_page —
-  // operations.ts:enforceSubagentSlugFence confines the target slug to the
-  // trusted-workspace allow-list (or the wiki/agents/<id>/ namespace) when
-  // ctx.viaSubagent=true, so a subagent can only append timeline entries to
-  // pages it could have written anyway.
-  'add_timeline_entry',
-  // v0.29 — Salience + Anomaly Detection. Both read-only. `get_recent_transcripts`
-  // is intentionally NOT included: subagent calls always have ctx.remote=true,
-  // and the v0.29 trust gate rejects remote callers — adding it here would be
-  // a footgun (subagent calls op, gets permission_denied, looks like a bug).
-  // The cycle synthesize phase already calls discoverTranscripts directly.
-  'get_recent_salience',
-  'find_anomalies',
-]);
+// The allow-list itself lives in a handler-free module so the MCP surface
+// tiers (src/mcp/surface.ts) can read it without this module's operations import.
+export { BRAIN_TOOL_ALLOWLIST };
 
 /**
  * v0.41 Approach C: per-tool usage_hint surfaced verbatim in the subagent
@@ -212,7 +173,7 @@ export interface BuildBrainToolsOpts {
    */
   sourceId?: string;
   /** Current remote owner grant; never populated from caller tool arguments. */
-  delegatedAuth?: Pick<AuthInfo, 'clientId' | 'scopes' | 'sourceId' | 'allowedSources'>;
+  delegatedAuth?: Pick<AuthInfo, 'clientId' | 'scopes' | 'sourceId' | 'allowedSources' | 'allowedOperations'>;
 }
 
 interface OpContextDeps {
@@ -243,7 +204,8 @@ function buildOpContext(deps: OpContextDeps): OperationContext {
     sourceId: deps.sourceId ?? 'default',
     // Preserve explicit per-call source checks without importing direct-write
     // fences or requiring direct read/write scopes for agent-only grants.
-    ...(deps.delegatedAuth ? { auth: { token: '', ...deps.delegatedAuth } } : {}),
+    ...(deps.delegatedAuth ? { auth: { token: '', ...deps.delegatedAuth,
+      principal: { kind: 'oauth_client' as const, id: deps.delegatedAuth.clientId } } } : {}),
     jobId: deps.jobId,
     subagentId: deps.subagentId,
     viaSubagent: true,           // FAIL-CLOSED: put_page etc. enforce namespace
@@ -289,8 +251,8 @@ export function buildBrainTools(opts: BuildBrainToolsOpts): ToolDef[] {
       name: toolName,
       description: op.description,
       input_schema: schema,
-      // v0.15 ships only idempotent brain tools (every allow-listed op is
-      // deterministic over its input; put_page re-writes the same slug).
+      // The persisted tool dispatcher binds mutations to a stable request UUID;
+      // a replay returns the original durable receipt without another write.
       idempotent: true,
       // v0.41 Approach C: surface usage_hint to the system-prompt renderer.
       // Keyed by the unprefixed op name. Undefined when no hint is registered.
@@ -317,9 +279,14 @@ export function buildBrainTools(opts: BuildBrainToolsOpts): ToolDef[] {
         // model instead of crashing inside the handler, and `since: ""` never
         // reaches a handler raw.
         const params = normalizeOptionalParams(op, raw);
+        // #6297: a subagent's full-content read returns the round-trip fields only, not the body twice.
+        if (op.name === 'get_page' && params.include_content === true) params.content_only = true;
         const validationError = validateParams(op, params);
         if (validationError) throw new Error(`${toolName}: ${validationError}`);
-        return op.handler(opCtx, params);
+        const output = await op.handler(opCtx, params);
+        const rejection = op.name === 'put_page' ? putPageRejection(output) : null;
+        if (rejection) throw new Error(rejection);
+        return output;
       },
     };
   });

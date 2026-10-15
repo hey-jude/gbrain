@@ -28,6 +28,10 @@ export const claudeCli: Recipe = {
   name: 'Claude (via CLI)',
   tier: 'native',
   implementation: 'claude-cli',
+  // Calls bill against the operator's Claude subscription, not per token, so
+  // `pricing.overrides` accepts a `claude-cli:*` provider wildcard (e.g. $0).
+  // Without one, claude-cli models price at Anthropic's API list rate.
+  billing: 'subscription',
   // The CLI owns auth; no env vars are required from the gateway side.
   auth_env: {
     required: [],
@@ -52,12 +56,15 @@ export const claudeCli: Recipe = {
       // Cheap model first: `providers explain` / init auto-pick advertise
       // models[0] for this touchpoint (same convention as the openai recipe).
       models: [
+        'claude-haiku-5-5',
         'claude-haiku-4-5-20251001',
         'claude-fable-5',
         'claude-fable-5-1',
+        'claude-opus-5-5',
         'claude-opus-5',
         'claude-opus-4-8',
         'claude-opus-4-7',
+        'claude-sonnet-5-5',
         'claude-sonnet-5',
         'claude-sonnet-4-6',
       ],
@@ -74,19 +81,32 @@ export const claudeCli: Recipe = {
       models: [
         'claude-fable-5',
         'claude-fable-5-1',
+        'claude-opus-5-5',
         'claude-opus-5',
         'claude-opus-4-8',
         'claude-opus-4-7',
+        'claude-sonnet-5-5',
         'claude-sonnet-5',
         'claude-sonnet-4-6',
+        'claude-haiku-5-5',
         'claude-haiku-4-5-20251001',
       ],
       supports_tools: true,
       supports_subagent_loop: true,
-      // The CLI handles caching internally and does not surface it via the
-      // standard cache_control control plane. From the gateway's POV the
-      // model does not support prompt caching.
-      supports_prompt_cache: false,
+      // The CLI caches prompt prefixes automatically — including the
+      // `--print` runs this provider dispatches, which Claude Code puts in
+      // its "main conversation" TTL bucket (one hour on a Claude
+      // subscription, five minutes on an API key).
+      // https://code.claude.com/docs/en/prompt-caching
+      //
+      // This field asks "does the provider cache at all" — see the contract
+      // on ProviderCapabilities.supportsPromptCaching in ../capabilities.ts,
+      // which is explicit that it is NOT "does it honor our markers", and
+      // that the degraded:no_caching advice "is wrong for a provider that
+      // caches without being asked". It was exactly that advice this recipe
+      // used to trigger. Declaring `false` because the gateway cannot drive
+      // the cache answered the other question.
+      supports_prompt_cache: true,
       max_context_tokens: 200000,
       // Cost figures match the underlying Claude API tier, but the actual
       // bill is borne by the subscription. We report them for the budget

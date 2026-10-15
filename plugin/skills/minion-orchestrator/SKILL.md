@@ -50,6 +50,7 @@ tools:
   - get_job_progress
 mutating: true
 upstream: long-ops@fc834ee, subagent-deadman@fc834ee, pipeline-stage-cache@fc834ee
+when_to_use: "Use when the user asks: \"gbrain jobs submit\", \"submit a gbrain job\", \"submit a shell job\", \"shell job\", \"run shell command in background\"."
 ---
 
 # Minion Orchestrator
@@ -117,9 +118,12 @@ tasks where no LLM reasoning loop is needed.
 
 ### Preconditions (read before submitting your first shell job)
 
-- **`GBRAIN_ALLOW_SHELL_JOBS=1` must be set on the worker environment.**
-  Without it, the shell handler refuses to register and submissions sit in
-  `waiting` silently. Gate lives in `src/core/minions/handlers/shell.ts`.
+- **The worker must be started with `gbrain jobs work --allow-shell-jobs`** (equivalently `GBRAIN_ALLOW_SHELL_JOBS=1` exported on the worker; a `.env` in the worker's directory cannot set it).
+  The shell handler is always registered but guarded: an unflagged worker that
+  claims a shell job dead-letters it immediately (`UnrecoverableError`, straight
+  to `dead`, no retries) with the flag named in `error_text`. A job that sits in
+  `waiting` means NO worker is running at all — check
+  `gbrain jobs supervisor status`. Gate lives in `src/core/minions/handlers/shell.ts`.
 - **Security:** flipping `GBRAIN_ALLOW_SHELL_JOBS=1` authorizes arbitrary
   command execution on the worker. On a shared queue, this is a remote code
   execution surface. Treat as privileged infrastructure authorization.
@@ -311,10 +315,24 @@ rung of this ladder the deployment supports**. This is a harness-routing
 convention the agent follows, not a mechanical guarantee — nothing stops a
 bare background shell except this skill saying don't.
 
+**Paid work gets consent before it is submitted.** A job runs without a
+terminal, so a paid command (`embed --stale`, or anything else that calls a
+model provider) stops with exit 3 and a consent payload unless it already
+carries the user's approval. Get that approval first, in the conversation:
+run the command's preview (for example `gbrain embed --stale --dry-run`),
+relay the estimate, and only after the user agrees put the approval in the
+submitted command (`gbrain embed --stale --yes --max-usd <cap>` with the cap
+they approved), or rely on a standing approval the user set with
+`gbrain config set consent.preapprove.paid.max_usd_per_run <usd>`. Never add
+`--yes` without the user's answer. When a job ends with exit 3 or the
+`confirmation_required` code, relay its message to the
+user and stop; don't resubmit it with `--yes`.
+
 ### Rung 1 — Minion job + deadman (Postgres + worker)
 
 Requires: Postgres engine, a running `gbrain jobs work` worker, and — for
-the shell lane — `GBRAIN_ALLOW_SHELL_JOBS=1` on the worker. All the
+the shell lane — a worker started with `--allow-shell-jobs` (or
+`GBRAIN_ALLOW_SHELL_JOBS=1` exported on it). All the
 Preconditions above still hold: the flag defaults OFF, shell submission is
 CLI-only across the MCP trust boundary, and PGLite has no worker daemon
 (see Rung 3). Nothing in this section loosens that contract.
@@ -497,6 +515,15 @@ Parent #ID — waiting-children
   #C subagent(Gamma) — paused
 Total tokens so far: 4.3k
 ```
+
+## When it fails
+
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- `gbrain jobs submit` over MCP for a protected job returns `permission_denied`: it must run from the trusted local CLI on the brain host; tell the user.
+- A shell job dead-letters immediately with the flag named in `error_text` (shell jobs disabled): tell the user which env flag the host operator must set; do not retry.
+- `rate_limited` from the submission cap: back off for the stated delay before resubmitting; do not fan out more submissions meanwhile.
+- A job sits in `waiting` with no worker: confirm a worker is registered (`gbrain jobs get <id>`) before resubmitting.
 
 ## Anti-Patterns
 

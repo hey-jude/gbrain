@@ -11,6 +11,7 @@ import type { SqlQuery } from '../src/core/sql-query.ts';
 import { PGLITE_SCHEMA_SQL } from '../src/core/pglite-schema.ts';
 import { mountConfidentialOAuth, mountOAuthConsent } from '../src/commands/serve-http-oauth.ts';
 import { hashToken } from '../src/core/utils.ts';
+import { MIGRATIONS } from '../src/core/migrate.ts';
 import { pgliteOAuthTransaction, TEST_PKCE_CHALLENGE, TEST_PKCE_VERIFIER } from './helpers/oauth.ts';
 
 let db: PGlite;
@@ -226,18 +227,158 @@ describe('owner-approved HTTP authorization', () => {
   });
 });
 
+/** In-memory grant store whose client row echoes the queried client_id, so many distinct clients can be simulated. */
+function memoryGrants() {
+  const row = { client_name: 'synthetic', scope: 'read', grant_types: ['authorization_code'], redirect_uris: [REDIRECT] };
+  const clock = { now: 0 };
+  const options = { sql: (async (_strings: TemplateStringsArray, ...values: unknown[]) => [{ ...row, client_id: values[0] }]) as SqlQuery, tokenTtl: 60, refreshTtl: 3600, now: () => clock.now };
+  return { grants: new OAuthGrants(options), options, clock, params: { codeChallenge: TEST_PKCE_CHALLENGE, redirectUri: REDIRECT } };
+}
+
+/** Anonymous dynamic registration (the advisory shape) must land on the same owner-consent gate as operator-registered clients. */
+describe('dynamically registered public clients', () => {
+  const ATTACKER_REDIRECT = 'https://client-example.invalid/cb';
+  async function registerDcr(overrides: Record<string, unknown> = {}, omit: string[] = []) {
+    const body: Record<string, unknown> = { client_name: 'synthetic self-registered client', redirect_uris: [ATTACKER_REDIRECT],
+      grant_types: ['authorization_code'], response_types: ['code'], scope: 'read write', token_endpoint_auth_method: 'none', ...overrides };
+    for (const key of omit) delete body[key];
+    const response = await fetch(`${base}/register`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    expect(response.status).toBe(201);
+    return response.json() as Promise<any>;
+  }
+  async function authorizeRaw(clientId: string, scope?: string) {
+    const query = new URLSearchParams({ client_id: clientId, response_type: 'code', redirect_uri: ATTACKER_REDIRECT,
+      code_challenge: TEST_PKCE_CHALLENGE, code_challenge_method: 'S256', state: 'attacker-state' });
+    if (scope !== undefined) query.set('scope', scope);
+    return fetch(`${base}/authorize?${query}`, { redirect: 'manual' });
+  }
+  async function expectPending(clientId: string, scope?: string) {
+    const response = await authorizeRaw(clientId, scope);
+    expect(response.status).toBe(302);
+    const location = new URL(response.headers.get('location')!, base);
+    expect(location.pathname).toBe('/admin/');
+    expect(location.searchParams.has('code')).toBe(false);
+    expect(location.hash).toBe('#oauth-consent');
+    expect(await sql`SELECT * FROM oauth_codes WHERE client_id = ${clientId}`).toHaveLength(0);
+    return location.searchParams.get('oauth_request')!;
+  }
+
+  test('anonymous registration with a foreign redirect_uri yields a consent request, never a code, and forged codes do not redeem', async () => {
+    const client = await registerDcr();
+    expect(client.client_id).toStartWith('gbrain_cl_');
+    expect(client.client_secret).toBeUndefined();
+    const id = await expectPending(client.client_id, 'read write');
+    expect(provider.grants.hasPending(id)).toBe(true);
+    const forged = await fetch(`${base}/token`, { method: 'POST', body: new URLSearchParams({
+      grant_type: 'authorization_code', code: 'gbrain_code_' + 'a'.repeat(43), code_verifier: TEST_PKCE_VERIFIER,
+      client_id: client.client_id, redirect_uri: ATTACKER_REDIRECT }) });
+    expect(forged.status).toBe(400);
+    expect((await forged.json() as any).error).toBe('invalid_grant');
+    expect(await sql`SELECT * FROM oauth_tokens WHERE client_id = ${client.client_id}`).toHaveLength(0);
+  });
+
+  test('registration omitting grant_types defaults to the consent-bearing authorization_code flow', async () => {
+    const client = await registerDcr({}, ['grant_types']);
+    expect(client.grant_types ?? ['authorization_code']).toEqual(['authorization_code']);
+    await expectPending(client.client_id, 'read write');
+  });
+
+  test('registration omitting scope registers no scope and its consent request carries no scopes', async () => {
+    const client = await registerDcr({}, ['scope']);
+    expect(client.scope ?? '').toBe('');
+    const id = await expectPending(client.client_id);
+    expect((await details(id)).scopes).toEqual([]);
+  });
+
+  test('the eleventh pending request for one client is a redirect carrying error=too_many_requests, not a 429', async () => {
+    // Contract pin for the docs: the per-client cap trips inside
+    // provider.authorize(), which the MCP SDK's phase-2 catch turns into a
+    // 302 back to the registered redirect_uri with error parameters. A 429
+    // body on /authorize only ever comes from the SDK's per-IP limiter.
+    const client = await registerDcr();
+    for (let i = 0; i < 10; i++) await expectPending(client.client_id, 'read');
+    const response = await authorizeRaw(client.client_id, 'read');
+    expect(response.status).toBe(302);
+    const location = new URL(response.headers.get('location')!);
+    expect(location.origin + location.pathname).toBe(ATTACKER_REDIRECT);
+    expect(location.searchParams.get('error')).toBe('too_many_requests');
+    expect(location.searchParams.get('error_description')).toMatch(/pending requests for this client/);
+    expect(location.searchParams.get('state')).toBe('attacker-state');
+    expect(location.searchParams.has('code')).toBe(false);
+    expect(await sql`SELECT * FROM oauth_codes WHERE client_id = ${client.client_id}`).toHaveLength(0);
+  });
+
+  test('#6202: source_id is accepted only on an approval, as a string, for an eligible request', async () => {
+    await sql`INSERT INTO sources (id, name) VALUES ('wiki-example', 'wiki-example') ON CONFLICT (id) DO NOTHING`;
+    // This suite boots the bare schema blob; the marker column arrives by migration.
+    await db.exec(MIGRATIONS.find(m => m.name === 'oauth_client_registered_via')!.sql);
+    const client = await registerDcr();
+    const id = await expectPending(client.client_id, 'read');
+    const request = await details(id);
+    expect(request.sourceChoice.editable).toBe(true);
+    expect(request.sourceChoice.options.map((o: { id: string }) => o.id)).toContain('wiki-example');
+    for (const extra of [{ source_id: 'wiki-example', decision: 'deny' }, { source_id: 42 }, { source_id: null }, { source_id: ['wiki-example'] }, { source: 'wiki-example' }]) {
+      const { decision = 'approve', ...rest } = extra as Record<string, unknown>;
+      const response = await decide(id, request.csrf, decision as string, OWNER, rest);
+      expect(response.status).toBe(403);
+      expect((await response.json() as any).error).toBe('invalid_consent');
+    }
+    expect((await decide(id, request.csrf, 'approve', OWNER, { source_id: 'not-offered-example' })).status).toBe(403);
+    expect((await decide(id, request.csrf, 'approve', OTHER_SESSION, { source_id: 'wiki-example' })).status).toBe(403);
+    expect(await sql`SELECT * FROM oauth_codes WHERE client_id = ${client.client_id}`).toHaveLength(0);
+    const response = await decide(id, request.csrf, 'approve', OWNER, { source_id: 'wiki-example' });
+    expect(response.status).toBe(200);
+    expect(new URL((await response.json() as any).redirectUrl).searchParams.get('code')).toStartWith('gbrain_code_');
+    const [row] = await sql`SELECT source_id, federated_read, grant_revision FROM oauth_clients WHERE client_id = ${client.client_id}`;
+    expect(row).toMatchObject({ source_id: 'wiki-example', federated_read: ['wiki-example'], grant_revision: 1 });
+    expect(await sql`SELECT actor, action FROM oauth_grant_audit WHERE client_id = ${client.client_id}`).toEqual([{ actor: 'owner', action: 'consent' }]);
+  });
+
+  test('#6202: an operator-registered client gets no source choice and a posted source_id is refused', async () => {
+    const { clientId } = await register();
+    const id = await begin(clientId);
+    const request = await details(id);
+    expect(request.sourceChoice).toEqual({ editable: false, options: [] });
+    expect((await decide(id, request.csrf, 'approve', OWNER, { source_id: 'default' })).status).toBe(403);
+    expect(await sql`SELECT * FROM oauth_codes WHERE client_id = ${clientId}`).toHaveLength(0);
+  });
+
+  test('a revoked self-registered client is rejected before any consent request is created', async () => {
+    const client = await registerDcr();
+    await provider.revokeClient(client.client_id);
+    const response = await authorizeRaw(client.client_id, 'read write');
+    expect(response.status).toBe(400);
+    expect((await response.json() as any).error).toBe('invalid_client');
+    await expect(provider.grants.begin(client.client_id, { codeChallenge: TEST_PKCE_CHALLENGE, redirectUri: ATTACKER_REDIRECT, scopes: ['read'] }))
+      .rejects.toThrow('revoked');
+  });
+});
+
 test('pending authorization expires, restart forgets it, and capacity is bounded without evicting live requests', async () => {
-  const row = { client_id: 'synthetic', client_name: 'synthetic', scope: 'read', grant_types: ['authorization_code'], redirect_uris: [REDIRECT] };
-  let now = 0;
-  const options = { sql: (async () => [row]) as SqlQuery, tokenTtl: 60, refreshTtl: 3600, now: () => now };
-  const grants = new OAuthGrants(options);
-  const params = { codeChallenge: TEST_PKCE_CHALLENGE, redirectUri: REDIRECT };
+  // Fill the global store from many distinct clients (the per-client cap bounds any single client well below this).
+  const { grants, options, clock, params } = memoryGrants();
   const first = await grants.begin('synthetic', params);
-  for (let i = 1; i < 1000; i++) await grants.begin('synthetic', params);
-  await expect(grants.begin('synthetic', params)).rejects.toThrow('Too many pending');
+  for (let i = 1; i < 1000; i++) await grants.begin(`synthetic-${i}`, params);
+  await expect(grants.begin('synthetic-overflow', params)).rejects.toThrow('Too many pending');
   expect(grants.details(first).clientId).toBe('synthetic');
   expect(() => new OAuthGrants(options).details(first)).toThrow('server restarted');
-  now = 600_001;
+  clock.now = 600_001;
   expect(() => grants.details(first)).toThrow('expired');
   await expect(grants.begin('synthetic', params)).resolves.toBeString();
+});
+
+test('a single client cannot hold more than ten pending requests, without starving other clients', async () => {
+  const { grants, clock, params } = memoryGrants();
+  const ids: string[] = [];
+  for (let i = 0; i < 10; i++) ids.push(await grants.begin('noisy', params));
+  await expect(grants.begin('noisy', params)).rejects.toThrow('Too many pending');
+  await expect(grants.begin('noisy', params)).rejects.toThrow('this client');
+  await expect(grants.begin('quiet', params)).resolves.toBeString();
+  expect(grants.details(ids[0]).clientId).toBe('noisy');
+  // Only requests still awaiting a decision count against the client's budget.
+  await grants.decide(ids[0], false);
+  await expect(grants.begin('noisy', params)).resolves.toBeString();
+  await expect(grants.begin('noisy', params)).rejects.toThrow('Too many pending');
+  clock.now = 600_001;
+  await expect(grants.begin('noisy', params)).resolves.toBeString();
 });
